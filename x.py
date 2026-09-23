@@ -336,6 +336,18 @@ def test_go(dir: str, cli_path: str, rest: List[str]) -> None:
     run(go, *args, cwd=str(basedir), verbose=True)
 
 
+def bench(dir: str, bench_path: str, rest: List[str]) -> None:
+    benchmark = find_command(bench_path, msg='redis-benchmark is required for benchmarking')
+    binpath = Path(dir).absolute() / 'kvrocks'
+    if not binpath.is_file():
+        raise RuntimeError(f"kvrocks binary not found: {binpath}")
+
+    print(f"kvrocks: {binpath}")
+    print(f"redis-benchmark: {benchmark}")
+    if rest:
+        print(f"extra args: {' '.join(rest)}")
+
+
 if __name__ == '__main__':
     parser = ArgumentParser(formatter_class=ArgumentDefaultsHelpFormatter)
     parser.set_defaults(func=parser.print_help)
@@ -469,6 +481,20 @@ if __name__ == '__main__':
     parser_test_go.add_argument('--cli-path', default='redis-cli', help="path of redis-cli to test kvrocks")
     parser_test_go.add_argument('rest', nargs=REMAINDER, help="the rest of arguments to forward to go test")
     parser_test_go.set_defaults(func=test_go)
+
+    parser_bench = subparsers.add_parser(
+        'bench',
+        description="Run redis-benchmark against a specific kvrocks build",
+        help="Run redis-benchmark against a specific kvrocks build",
+        formatter_class=ArgumentDefaultsHelpFormatter,
+    )
+    parser_bench.add_argument('dir', metavar='BUILD_DIR', nargs='?', default='build',
+                             help="directory including kvrocks build files")
+    parser_bench.add_argument('--bench-path', default='redis-benchmark',
+                             help="path of redis-benchmark used to bench kvrocks")
+    parser_bench.add_argument('rest', nargs=REMAINDER,
+                             help="the rest of arguments to forward to redis-benchmark")
+    parser_bench.set_defaults(func=bench)
 
     parser_prepare = subparsers.add_parser(
         'prepare',
