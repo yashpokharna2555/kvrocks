@@ -137,6 +137,35 @@ $ ./x.py test cpp # run C++ unit tests
 $ ./x.py test go # run Golang (unit and integration) test cases
 ```
 
+### Running a local benchmark
+
+Build Kvrocks and install `redis-benchmark` 6.2 or newer, then run:
+
+```shell
+$ ./x.py bench build
+$ ./x.py bench build --requests 100000 --clients 50 --data-size 64 --pipeline 1 --output-dir benchmark-results
+```
+
+The runner starts an isolated local server and benchmarks SET followed by GET.
+Defaults are 10,000 requests per command, 10 clients, 3-byte values, and no pipelining.
+It uses a single key, with no warm-up or repeated measurements yet. Startup has a
+30-second timeout and the benchmark has a 120-second timeout.
+
+Each run prints its artifact directory (`benchmark-results/run-*` by default).
+It contains `results.json` with the run status, workload settings, benchmark version,
+and per-command throughput and latency in milliseconds; `benchmark.csv` with raw
+output; `benchmark.stderr.log`; and `server.log`. Logs and a failure summary are
+retained after execution errors or interruption, while temporary database files
+are removed. Invalid arguments are rejected before creating artifacts.
+
+A successful run requires both command results with valid measurements and no
+reported benchmark errors. Performance comparisons and CI integration are not
+included yet. The Python runner tests do not require a built Kvrocks binary:
+
+```shell
+$ python3 -B -m unittest discover -s tests/python -v
+```
+
 ### Supported platforms
 
 * OS: Linux and macOS

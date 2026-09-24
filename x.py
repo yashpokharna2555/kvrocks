@@ -18,18 +18,22 @@
 # under the License.
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter, REMAINDER
+import csv
+import io
+import json
+import math
 from glob import glob
 import os
 from pathlib import Path
 import re
 import filecmp
-from subprocess import Popen, PIPE, TimeoutExpired
+from subprocess import Popen, PIPE, STDOUT, TimeoutExpired, run as subprocess_run
 import socket
 import sys
 import time
 from typing import List, Any, Optional, IO, Tuple
 from shutil import which
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 
 CMAKE_REQUIRE_VERSION = (3, 16, 0)
 CLANG_FORMAT_REQUIRED_VERSION = (18, 0, 0)
@@ -338,17 +342,76 @@ def test_go(dir: str, cli_path: str, rest: List[str]) -> None:
     run(go, *args, cwd=str(basedir), verbose=True)
 
 
-def bench(dir: str, bench_path: str, rest: List[str]) -> None:
-    if rest:
-        raise RuntimeError(
-            "Extra benchmark arguments are not supported yet. "
-            "Place --bench-path before BUILD_DIR."
-        )
+def parse_benchmark_results(output: str) -> List[dict]:
+    columns = ['test', 'rps', 'avg_latency_ms', 'min_latency_ms', 'p50_latency_ms',
+               'p95_latency_ms', 'p99_latency_ms', 'max_latency_ms']
+    reader = csv.reader(io.StringIO(output), strict=True)
+    results = []
+    seen = set()
+    try:
+        if next(reader, None) != columns:
+            raise ValueError('expected the redis-benchmark 6.2+ CSV header')
+        for row in reader:
+            if not row:
+                continue
+            if len(row) != len(columns) or row[0] not in ('SET', 'GET') or row[0] in seen:
+                raise ValueError('unexpected or duplicate benchmark row')
+            measurements = dict(zip(columns[1:], map(float, row[1:])))
+            if any(not math.isfinite(value) or value < 0 for value in measurements.values()):
+                raise ValueError('measurements must be finite and nonnegative')
+            if measurements['rps'] == 0:
+                raise ValueError('throughput must be positive')
+            results.append({'command': row[0], **measurements})
+            seen.add(row[0])
+        if seen != {'SET', 'GET'}:
+            raise ValueError('missing SET or GET measurements')
+    except (ValueError, csv.Error) as error:
+        raise RuntimeError(f'Invalid benchmark output: {error}') from error
+    return results
+
+
+def bench(dir: str, bench_path: str, output_dir: str = 'benchmark-results',
+          requests: int = 10000, clients: int = 10, data_size: int = 3,
+          pipeline: int = 1) -> None:
+    settings = {'requests': requests, 'clients': clients, 'data_size': data_size, 'pipeline': pipeline}
+    if any(value <= 0 or value > 2147483647 for value in settings.values()):
+        raise RuntimeError('Benchmark settings must be positive 32-bit integers')
+
+    output_root = Path(output_dir).absolute()
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifacts = Path(mkdtemp(prefix='run-', dir=str(output_root)))
+    report = {'schema_version': 1, 'status': 'failed', 'settings': settings,
+              'kvrocks': str(Path(dir).absolute() / 'kvrocks'), 'results': []}
+    print(f'Benchmark artifacts: {artifacts}', flush=True)
+    try:
+        with (artifacts / 'server.log').open('w', encoding='utf-8') as server_log, \
+                (artifacts / 'benchmark.csv').open('w', encoding='utf-8') as output, \
+                (artifacts / 'benchmark.stderr.log').open('w', encoding='utf-8') as errors:
+            run_benchmark(dir, bench_path, settings, server_log, output, errors, report)
+        diagnostics = (artifacts / 'benchmark.stderr.log').read_text(encoding='utf-8', errors='replace')
+        if re.search(r'error|failed|could not|disconnected|aborting', diagnostics, re.IGNORECASE):
+            raise RuntimeError('redis-benchmark reported errors; see benchmark.stderr.log')
+        report['results'] = parse_benchmark_results((artifacts / 'benchmark.csv').read_text(encoding='utf-8'))
+        report['status'] = 'success'
+    except BaseException as error:
+        report['status'] = 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed'
+        report['error'] = str(error) or type(error).__name__
+        raise
+    finally:
+        (artifacts / 'results.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+    for result in report['results']:
+        print(f"{result['command']}: {result['rps']:.2f} requests/s, p50 {result['p50_latency_ms']:.3f} ms")
+
+
+def run_benchmark(dir: str, bench_path: str, settings: dict, server_log: IO[str],
+                  output: IO[str], errors: IO[str], report: dict) -> None:
 
     benchmark = find_command(bench_path, msg='redis-benchmark is required for benchmarking')
     binpath = Path(dir).absolute() / 'kvrocks'
     if not binpath.is_file():
         raise RuntimeError(f"kvrocks binary not found: {binpath}")
+    version = subprocess_run([benchmark, '--version'], capture_output=True, text=True, check=True, timeout=10)
+    report['benchmark_version'] = version.stdout.strip()
 
     host = '127.0.0.1'
     # The reservation must be released before Kvrocks can bind this port.
@@ -379,7 +442,7 @@ def bench(dir: str, bench_path: str, rest: List[str]) -> None:
         ]
 
         print(f"Starting Kvrocks on {host}:{port}", flush=True)
-        server = Popen(server_args, cwd=workspace)
+        server = Popen(server_args, cwd=workspace, stdout=server_log, stderr=STDOUT)
         benchmark_process = None
 
         try:
@@ -413,11 +476,15 @@ def bench(dir: str, bench_path: str, rest: List[str]) -> None:
                 '-h', host,
                 '-p', str(port),
                 '-t', 'set,get',
-                '-n', '10000',
-                '-c', '10',
+                '-n', str(settings['requests']),
+                '-c', str(settings['clients']),
+                '-d', str(settings['data_size']),
+                '-P', str(settings['pipeline']),
+                '--csv',
             ]
+            report['benchmark_command'] = benchmark_args
             print(f"Running: {' '.join(benchmark_args)}", flush=True)
-            benchmark_process = Popen(benchmark_args)
+            benchmark_process = Popen(benchmark_args, stdout=output, stderr=errors)
             benchmark_deadline = time.monotonic() + 120
             while benchmark_process.poll() is None:
                 if server.poll() is not None:
@@ -430,7 +497,6 @@ def bench(dir: str, bench_path: str, rest: List[str]) -> None:
                 raise RuntimeError(f"redis-benchmark failed: {benchmark_process.returncode}")
             if server.poll() is not None:
                 raise RuntimeError(f"Kvrocks exited during benchmarking: {server.returncode}")
-            print("Benchmark completed successfully.", flush=True)
         finally:
             try:
                 if benchmark_process is not None:
@@ -583,8 +649,11 @@ if __name__ == '__main__':
                              help="directory including kvrocks build files")
     parser_bench.add_argument('--bench-path', default='redis-benchmark',
                              help="path of redis-benchmark used to bench kvrocks")
-    parser_bench.add_argument('rest', nargs=REMAINDER,
-                             help="reserved for future benchmark arguments; currently rejected")
+    parser_bench.add_argument('--output-dir', default='benchmark-results', help="directory for benchmark artifacts")
+    parser_bench.add_argument('--requests', type=int, default=10000, help="requests per command")
+    parser_bench.add_argument('--clients', type=int, default=10, help="concurrent clients")
+    parser_bench.add_argument('--data-size', type=int, default=3, help="value size in bytes")
+    parser_bench.add_argument('--pipeline', type=int, default=1, help="requests per pipeline")
     parser_bench.set_defaults(func=bench)
 
     parser_prepare = subparsers.add_parser(
