@@ -200,8 +200,26 @@ individual run reports. Raw output and logs are kept under its `baseline` and
 `candidate` subdirectories. A positive percentage means the measurement
 increased: this is better for throughput and worse for latency.
 
-This command does not select commits or build revisions automatically. CI
-integration will supply the two builds.
+This local command does not select commits or build revisions automatically.
+
+### Benchmark CI
+
+The Benchmark workflow runs on pull requests, pushes to `unstable`, and manual
+requests from GitHub Actions. It compares the PR head with the PR base commit,
+or the pushed commit with the branch tip before the push. Manual runs compare
+the selected commit with its first parent. If the baseline is unavailable,
+the workflow measures only the candidate and explains why no comparison was made.
+
+Both revisions are built with GCC in Release mode on the same Ubuntu runner.
+The candidate's benchmark runner measures both binaries using Redis 6.2.14's
+`redis-benchmark`, 100,000 requests per command, 50 clients, 64-byte values,
+three runs per build, and a 20% warning threshold. Each revision uses its own
+declared dependency versions; dependency archives are cached between jobs.
+
+Results appear in the GitHub Actions job summary. Regressions produce warnings;
+build failures, crashes, invalid output, and timeouts fail the job. Artifacts
+include commit IDs, environment information, build logs, benchmark logs, and
+JSON results, retained for 14 days. No daily schedule is configured.
 
 ### Supported platforms
 

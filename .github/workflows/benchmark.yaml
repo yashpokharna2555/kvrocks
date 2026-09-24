@@ -1,0 +1,134 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Benchmark
+
+on:
+  push:
+    branches: [unstable]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-${{ github.event_name }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    if: ${{ !github.event.deleted }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: candidate
+    env:
+      KVROCKS_DEPS_CACHE_DIR: ${{ github.workspace }}/build-deps
+      REDIS_VERSION: 6.2.14
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select baseline
+        id: revisions
+        run: python3 .github/scripts/benchmark_ci.py prepare
+
+      - name: Check out baseline
+        if: steps.revisions.outputs.baseline != ''
+        env:
+          BASELINE_SHA: ${{ steps.revisions.outputs.baseline }}
+        run: git worktree add --detach "$GITHUB_WORKSPACE/baseline" "$BASELINE_SHA"
+
+      - name: Prepare build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build autoconf automake libtool libssl-dev
+
+      - name: Cache dependency archives
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.KVROCKS_DEPS_CACHE_DIR }}
+          key: benchmark-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('candidate/CMakeLists.txt', 'candidate/cmake/**/*.cmake', 'baseline/CMakeLists.txt', 'baseline/cmake/**/*.cmake') }}
+
+      - name: Build redis-benchmark
+        run: |
+          curl --fail --location --retry 3 "https://download.redis.io/releases/redis-$REDIS_VERSION.tar.gz" -o "$RUNNER_TEMP/redis.tar.gz"
+          tar -xzf "$RUNNER_TEMP/redis.tar.gz" -C "$RUNNER_TEMP"
+          make -C "$RUNNER_TEMP/redis-$REDIS_VERSION" -j2 MALLOC=libc redis-benchmark
+          echo "BENCHMARK_PATH=$RUNNER_TEMP/redis-$REDIS_VERSION/src/redis-benchmark" >> "$GITHUB_ENV"
+
+      - name: Test benchmark runner
+        run: python3 -B -m unittest discover -s tests/python -v
+
+      - name: Record environment
+        run: |
+          {
+            uname -a
+            lscpu
+            gcc --version
+            cmake --version
+            "$BENCHMARK_PATH" --version
+          } > benchmark-results/environment.log
+
+      - name: Build candidate
+        run: |
+          set -o pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DDEPS_FETCH_DIR="$KVROCKS_DEPS_CACHE_DIR" 2>&1 | tee benchmark-results/candidate-configure.log
+          cmake --build build --target kvrocks -j2 2>&1 | tee benchmark-results/candidate-build.log
+
+      - name: Build baseline
+        if: steps.revisions.outputs.baseline != ''
+        run: |
+          set -o pipefail
+          cmake -S "$GITHUB_WORKSPACE/baseline" -B "$GITHUB_WORKSPACE/baseline/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DDEPS_FETCH_DIR="$KVROCKS_DEPS_CACHE_DIR" 2>&1 | tee benchmark-results/baseline-configure.log
+          cmake --build "$GITHUB_WORKSPACE/baseline/build" --target kvrocks -j2 2>&1 | tee benchmark-results/baseline-build.log
+
+      - name: Run benchmark
+        id: benchmark
+        timeout-minutes: 20
+        env:
+          BASELINE_SHA: ${{ steps.revisions.outputs.baseline }}
+        run: |
+          if [[ -n "$BASELINE_SHA" ]]; then
+            python3 x.py bench-compare "$GITHUB_WORKSPACE/baseline/build" build --bench-path "$BENCHMARK_PATH" --requests 100000 --clients 50 --data-size 64 --repeats 3 --threshold 20
+          else
+            python3 x.py bench build --bench-path "$BENCHMARK_PATH" --requests 100000 --clients 50 --data-size 64
+          fi
+
+      - name: Publish summary
+        if: always()
+        env:
+          BENCHMARK_OUTCOME: ${{ steps.benchmark.outcome }}
+          BENCHMARK_JOB_STATUS: ${{ job.status }}
+        run: python3 .github/scripts/benchmark_ci.py summary
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-${{ github.run_id }}-${{ github.run_attempt }}
+          path: candidate/benchmark-results/
+          if-no-files-found: warn
+          retention-days: 14
