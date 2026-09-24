@@ -23,8 +23,10 @@ import os
 from pathlib import Path
 import re
 import filecmp
-from subprocess import Popen, PIPE
+from subprocess import Popen, PIPE, TimeoutExpired
+import socket
 import sys
+import time
 from typing import List, Any, Optional, IO, Tuple
 from shutil import which
 from tempfile import TemporaryDirectory
@@ -337,15 +339,104 @@ def test_go(dir: str, cli_path: str, rest: List[str]) -> None:
 
 
 def bench(dir: str, bench_path: str, rest: List[str]) -> None:
+    if rest:
+        raise RuntimeError(
+            "Extra benchmark arguments are not supported yet. "
+            "Place --bench-path before BUILD_DIR."
+        )
+
     benchmark = find_command(bench_path, msg='redis-benchmark is required for benchmarking')
     binpath = Path(dir).absolute() / 'kvrocks'
     if not binpath.is_file():
         raise RuntimeError(f"kvrocks binary not found: {binpath}")
 
-    print(f"kvrocks: {binpath}")
-    print(f"redis-benchmark: {benchmark}")
-    if rest:
-        print(f"extra args: {' '.join(rest)}")
+    host = '127.0.0.1'
+    # The reservation must be released before Kvrocks can bind this port.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind((host, 0))
+        port = reservation.getsockname()[1]
+
+    def stop_process(process: Popen) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    with TemporaryDirectory(prefix='kvrocks-bench-') as workspace:
+        server_args = [
+            str(binpath),
+            '--bind', host,
+            '--port', str(port),
+            '--dir', workspace,
+            '--pidfile', str(Path(workspace) / 'kvrocks.pid'),
+            '--log-dir', 'stdout',
+            '--daemonize', 'no',
+            '--supervised', 'no',
+        ]
+
+        print(f"Starting Kvrocks on {host}:{port}", flush=True)
+        server = Popen(server_args, cwd=workspace)
+        benchmark_process = None
+
+        try:
+            startup_deadline = time.monotonic() + 30
+            while True:
+                if server.poll() is not None:
+                    raise RuntimeError(f"Kvrocks exited during startup: {server.returncode}")
+                if time.monotonic() >= startup_deadline:
+                    raise RuntimeError("Kvrocks did not become ready within 30 seconds")
+
+                try:
+                    with socket.create_connection((host, port), timeout=1) as client:
+                        client.sendall(b'*1\r\n$4\r\nPING\r\n')
+                        response = b''
+                        while len(response) < 7:
+                            chunk = client.recv(7 - len(response))
+                            if not chunk:
+                                break
+                            response += chunk
+                        if response == b'+PONG\r\n':
+                            break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+
+            if server.poll() is not None:
+                raise RuntimeError("Kvrocks exited before the benchmark started")
+
+            benchmark_args = [
+                benchmark,
+                '-h', host,
+                '-p', str(port),
+                '-t', 'set,get',
+                '-n', '10000',
+                '-c', '10',
+            ]
+            print(f"Running: {' '.join(benchmark_args)}", flush=True)
+            benchmark_process = Popen(benchmark_args)
+            benchmark_deadline = time.monotonic() + 120
+            while benchmark_process.poll() is None:
+                if server.poll() is not None:
+                    raise RuntimeError(f"Kvrocks exited during benchmarking: {server.returncode}")
+                if time.monotonic() >= benchmark_deadline:
+                    raise RuntimeError("Benchmark exceeded its 120-second timeout")
+                time.sleep(0.1)
+
+            if benchmark_process.returncode != 0:
+                raise RuntimeError(f"redis-benchmark failed: {benchmark_process.returncode}")
+            if server.poll() is not None:
+                raise RuntimeError(f"Kvrocks exited during benchmarking: {server.returncode}")
+            print("Benchmark completed successfully.", flush=True)
+        finally:
+            try:
+                if benchmark_process is not None:
+                    stop_process(benchmark_process)
+            finally:
+                stop_process(server)
 
 
 if __name__ == '__main__':
@@ -493,7 +584,7 @@ if __name__ == '__main__':
     parser_bench.add_argument('--bench-path', default='redis-benchmark',
                              help="path of redis-benchmark used to bench kvrocks")
     parser_bench.add_argument('rest', nargs=REMAINDER,
-                             help="the rest of arguments to forward to redis-benchmark")
+                             help="reserved for future benchmark arguments; currently rejected")
     parser_bench.set_defaults(func=bench)
 
     parser_prepare = subparsers.add_parser(
