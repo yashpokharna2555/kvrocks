@@ -29,6 +29,7 @@ import re
 import filecmp
 from subprocess import Popen, PIPE, STDOUT, TimeoutExpired, run as subprocess_run
 import socket
+from statistics import median
 import sys
 import time
 from typing import List, Any, Optional, IO, Tuple
@@ -372,7 +373,7 @@ def parse_benchmark_results(output: str) -> List[dict]:
 
 def bench(dir: str, bench_path: str, output_dir: str = 'benchmark-results',
           requests: int = 10000, clients: int = 10, data_size: int = 3,
-          pipeline: int = 1) -> None:
+          pipeline: int = 1) -> dict:
     settings = {'requests': requests, 'clients': clients, 'data_size': data_size, 'pipeline': pipeline}
     if any(value <= 0 or value > 2147483647 for value in settings.values()):
         raise RuntimeError('Benchmark settings must be positive 32-bit integers')
@@ -381,7 +382,7 @@ def bench(dir: str, bench_path: str, output_dir: str = 'benchmark-results',
     output_root.mkdir(parents=True, exist_ok=True)
     artifacts = Path(mkdtemp(prefix='run-', dir=str(output_root)))
     report = {'schema_version': 1, 'status': 'failed', 'settings': settings,
-              'kvrocks': str(Path(dir).absolute() / 'kvrocks'), 'results': []}
+              'kvrocks': str(Path(dir).absolute() / 'kvrocks'), 'artifacts': str(artifacts), 'results': []}
     print(f'Benchmark artifacts: {artifacts}', flush=True)
     try:
         with (artifacts / 'server.log').open('w', encoding='utf-8') as server_log, \
@@ -401,6 +402,79 @@ def bench(dir: str, bench_path: str, output_dir: str = 'benchmark-results',
         (artifacts / 'results.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n', encoding='utf-8')
     for result in report['results']:
         print(f"{result['command']}: {result['rps']:.2f} requests/s, p50 {result['p50_latency_ms']:.3f} ms")
+    return report
+
+
+def compare_benchmark_results(baseline: List[dict], candidate: List[dict], threshold: float) -> List[dict]:
+    if not baseline or len(baseline) != len(candidate):
+        raise RuntimeError('Comparison requires equal, nonempty sets of benchmark runs')
+    reference = baseline[0]
+    for run in baseline + candidate:
+        if run['status'] != 'success':
+            raise RuntimeError('Cannot compare failed benchmark runs')
+        if run['settings'] != reference['settings'] or run['benchmark_version'] != reference['benchmark_version']:
+            raise RuntimeError('Comparison requires identical workloads and benchmark versions')
+
+    comparisons = []
+    for command in ('SET', 'GET'):
+        groups = [[next(result for result in run['results'] if result['command'] == command)
+                   for run in runs] for runs in (baseline, candidate)]
+        for metric in ('rps', 'avg_latency_ms', 'p50_latency_ms', 'p95_latency_ms', 'p99_latency_ms'):
+            before, after = [median(result[metric] for result in group) for group in groups]
+            change = 100 * (after - before) / before if before else None
+            degradation = (-change if metric == 'rps' else change) if change is not None else None
+            regression = degradation is not None and (
+                degradation >= threshold or math.isclose(degradation, threshold, rel_tol=1e-12)
+            )
+            comparisons.append({'command': command, 'metric': metric, 'baseline_median': before,
+                                'candidate_median': after, 'change_percent': change, 'regression': regression})
+    return comparisons
+
+
+def bench_compare(baseline_dir: str, candidate_dir: str, bench_path: str = 'redis-benchmark',
+                  output_dir: str = 'benchmark-results', requests: int = 10000, clients: int = 10,
+                  data_size: int = 3, pipeline: int = 1, repeats: int = 3, threshold: float = 20) -> None:
+    if repeats < 3:
+        raise RuntimeError('Comparison requires at least 3 measured runs per build')
+    if not math.isfinite(threshold) or threshold <= 0 or threshold > 100:
+        raise RuntimeError('Regression threshold must be greater than 0 and at most 100 percent')
+    settings = {'requests': requests, 'clients': clients, 'data_size': data_size, 'pipeline': pipeline}
+    if any(value <= 0 or value > 2147483647 for value in settings.values()):
+        raise RuntimeError('Benchmark settings must be positive 32-bit integers')
+
+    output_root = Path(output_dir).absolute()
+    output_root.mkdir(parents=True, exist_ok=True)
+    artifacts = Path(mkdtemp(prefix='comparison-', dir=str(output_root)))
+    report = {'schema_version': 1, 'status': 'failed', 'repeats': repeats, 'threshold_percent': threshold,
+              'settings': settings, 'baseline_dir': str(Path(baseline_dir).absolute()),
+              'candidate_dir': str(Path(candidate_dir).absolute()), 'baseline_runs': [], 'candidate_runs': [],
+              'comparisons': []}
+    print(f'Comparison artifacts: {artifacts}', flush=True)
+    try:
+        for iteration in range(repeats):
+            # Reverse each pair to reduce systematic bias from always running one build first.
+            order = ('baseline', 'candidate') if iteration % 2 == 0 else ('candidate', 'baseline')
+            for role in order:
+                print(f'{role}: measured run {iteration + 1}/{repeats}', flush=True)
+                result = bench(report[f'{role}_dir'], bench_path,
+                               output_dir=str(artifacts / role), **settings)
+                report[f'{role}_runs'].append(result)
+        report['comparisons'] = compare_benchmark_results(report['baseline_runs'], report['candidate_runs'], threshold)
+        report['status'] = 'warning' if any(item['regression'] for item in report['comparisons']) else 'success'
+    except BaseException as error:
+        report['status'] = 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed'
+        report['error'] = str(error) or type(error).__name__
+        raise
+    finally:
+        (artifacts / 'comparison.json').write_text(json.dumps(report, indent=2, allow_nan=False) + '\n', encoding='utf-8')
+
+    for item in report['comparisons']:
+        change = item['change_percent']
+        change_text = f'{change:+.2f}%' if change is not None else 'unavailable (zero baseline)'
+        prefix = 'WARNING: ' if item['regression'] else ''
+        print(f"{prefix}{item['command']} {item['metric']}: "
+              f"{item['baseline_median']:.3f} -> {item['candidate_median']:.3f}, change {change_text}")
+    print(f"Comparison completed: {report['status']}. Report: {artifacts / 'comparison.json'}")
 
 
 def run_benchmark(dir: str, bench_path: str, settings: dict, server_log: IO[str],
@@ -655,6 +729,23 @@ if __name__ == '__main__':
     parser_bench.add_argument('--data-size', type=int, default=3, help="value size in bytes")
     parser_bench.add_argument('--pipeline', type=int, default=1, help="requests per pipeline")
     parser_bench.set_defaults(func=bench)
+
+    parser_compare = subparsers.add_parser(
+        'bench-compare', description="Compare two Kvrocks builds using repeated benchmark runs",
+        help="Compare two Kvrocks builds", formatter_class=ArgumentDefaultsHelpFormatter,
+    )
+    parser_compare.add_argument('baseline_dir', metavar='BASELINE_BUILD_DIR')
+    parser_compare.add_argument('candidate_dir', metavar='CANDIDATE_BUILD_DIR')
+    parser_compare.add_argument('--bench-path', default='redis-benchmark', help="path of redis-benchmark")
+    parser_compare.add_argument('--output-dir', default='benchmark-results', help="directory for comparison artifacts")
+    parser_compare.add_argument('--requests', type=int, default=10000, help="requests per command")
+    parser_compare.add_argument('--clients', type=int, default=10, help="concurrent clients")
+    parser_compare.add_argument('--data-size', type=int, default=3, help="value size in bytes")
+    parser_compare.add_argument('--pipeline', type=int, default=1, help="requests per pipeline")
+    parser_compare.add_argument('--repeats', type=int, default=3, help="measured runs per build (minimum 3)")
+    parser_compare.add_argument('--threshold', type=float, default=20,
+                                help="minimum throughput decrease or latency increase to warn about, in percent")
+    parser_compare.set_defaults(func=bench_compare)
 
     parser_prepare = subparsers.add_parser(
         'prepare',

@@ -214,6 +214,86 @@ class BenchmarkParserTest(unittest.TestCase):
         self.assertIn('positive 32-bit', result.stderr)
 
 
+class BenchmarkComparisonTest(unittest.TestCase):
+    def run_result(self, rps=10000, latency=1):
+        return {'status': 'success', 'settings': {'requests': 10000}, 'benchmark_version': 'fixture',
+                'results': [{'command': command, 'rps': rps, 'avg_latency_ms': latency,
+                             'p50_latency_ms': latency, 'p95_latency_ms': latency, 'p99_latency_ms': latency}
+                            for command in ('SET', 'GET')]}
+
+    def test_median_ignores_single_outlier(self):
+        baseline = [self.run_result(rps=value) for value in (10000, 10000, 1000000)]
+        candidate = [self.run_result(rps=value) for value in (10000, 10000, 1)]
+        comparisons = x.compare_benchmark_results(baseline, candidate, 20)
+        self.assertFalse(any(item['regression'] for item in comparisons))
+        self.assertEqual(comparisons[0]['candidate_median'], 10000)
+
+    def test_throughput_threshold_boundary_and_improvement(self):
+        for rps, expected in ((8001, False), (8000, True), (7999, True), (12000, False)):
+            with self.subTest(rps=rps):
+                comparison = x.compare_benchmark_results([self.run_result()], [self.run_result(rps=rps)], 20)
+                self.assertEqual(comparison[0]['regression'], expected)
+                self.assertAlmostEqual(comparison[0]['change_percent'], (rps - 10000) / 100)
+
+    def test_latency_increase_is_regression_but_decrease_is_not(self):
+        for latency, expected in ((1.25, True), (1.2, True), (1.199, False), (0.75, False)):
+            with self.subTest(latency=latency):
+                comparison = x.compare_benchmark_results([self.run_result()], [self.run_result(latency=latency)], 20)
+                self.assertEqual(comparison[1]['regression'], expected)
+
+    def test_zero_latency_baseline_has_no_percentage(self):
+        comparison = x.compare_benchmark_results([self.run_result(latency=0)], [self.run_result()], 20)
+        self.assertIsNone(comparison[1]['change_percent'])
+        self.assertFalse(comparison[1]['regression'])
+        json.dumps(comparison, allow_nan=False)
+
+    def test_rejects_failed_or_incompatible_runs(self):
+        for field, value in [('status', 'failed'), ('settings', {}), ('benchmark_version', 'other')]:
+            candidate = self.run_result()
+            candidate[field] = value
+            with self.subTest(field=field), self.assertRaises(RuntimeError):
+                x.compare_benchmark_results([self.run_result()], [candidate], 20)
+        with self.assertRaises(RuntimeError):
+            x.compare_benchmark_results([], [], 20)
+        with self.assertRaises(RuntimeError):
+            x.compare_benchmark_results([self.run_result()], [], 20)
+
+    def test_warning_keeps_successful_exit_and_alternates_builds(self):
+        with TemporaryDirectory() as workspace:
+            def measure(dir, bench_path, **kwargs):
+                return self.run_result(rps=7000 if Path(dir).name == 'candidate' else 10000)
+            with patch.object(x, 'bench', side_effect=measure) as runner:
+                x.bench_compare('baseline', 'candidate', output_dir=workspace)
+            order = [Path(call.args[0]).name for call in runner.call_args_list]
+            self.assertEqual(order, ['baseline', 'candidate', 'candidate', 'baseline', 'baseline', 'candidate'])
+            report = json.loads(next(Path(workspace).glob('comparison-*/comparison.json')).read_text())
+            self.assertEqual(report['status'], 'warning')
+            self.assertEqual(len(report['baseline_runs']), 3)
+            self.assertEqual(len(report['candidate_runs']), 3)
+            self.assertAlmostEqual(report['comparisons'][0]['change_percent'], -30)
+            self.assertEqual(runner.call_args.kwargs['requests'], 10000)
+
+    def test_failure_and_interruption_save_partial_report(self):
+        for error, status in [(RuntimeError('server crashed'), 'failed'), (KeyboardInterrupt(), 'interrupted')]:
+            with self.subTest(status=status), TemporaryDirectory() as workspace:
+                with patch.object(x, 'bench', side_effect=[self.run_result(), error]) as runner:
+                    with self.assertRaises(type(error)):
+                        x.bench_compare('baseline', 'candidate', output_dir=workspace)
+                report = json.loads(next(Path(workspace).glob('comparison-*/comparison.json')).read_text())
+                self.assertEqual(report['status'], status)
+                self.assertEqual(len(report['baseline_runs']), 1)
+                self.assertEqual(report['comparisons'], [])
+                self.assertEqual(runner.call_count, 2)
+
+    def test_invalid_options_do_not_run_benchmarks(self):
+        for options in ({'repeats': 2}, {'threshold': 0}, {'threshold': 101}, {'threshold': float('nan')},
+                        {'threshold': float('inf')}, {'clients': 0}):
+            with self.subTest(options=options), patch.object(x, 'bench') as runner:
+                with self.assertRaises(RuntimeError):
+                    x.bench_compare('baseline', 'candidate', **options)
+                runner.assert_not_called()
+
+
 @unittest.skipUnless(sys.platform.startswith('linux'), 'executable fixtures require Linux')
 class BenchmarkProcessTest(unittest.TestCase):
     def test_real_process_output_capture_and_cleanup(self):
@@ -249,6 +329,20 @@ class BenchmarkProcessTest(unittest.TestCase):
             server_pid = int((artifacts / 'server.log').read_text().strip())
             with self.assertRaises(ProcessLookupError):
                 os.kill(server_pid, 0)
+
+            comparison = subprocess.run(
+                [sys.executable, '-B', str(Path(x.__file__)), 'bench-compare', str(root), str(root),
+                 '--bench-path', str(benchmark), '--output-dir', str(root / 'results')],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(comparison.returncode, 0, comparison.stderr)
+            summary = next((root / 'results').glob('comparison-*/comparison.json'))
+            comparison_report = json.loads(summary.read_text())
+            self.assertEqual(comparison_report['status'], 'success')
+            self.assertEqual(len(comparison_report['baseline_runs']), 3)
+            self.assertEqual(len(comparison_report['candidate_runs']), 3)
+            for run in comparison_report['baseline_runs'] + comparison_report['candidate_runs']:
+                self.assertTrue((Path(run['artifacts']) / 'results.json').is_file())
 
 
 if __name__ == '__main__':

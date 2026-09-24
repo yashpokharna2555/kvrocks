@@ -159,12 +159,49 @@ retained after execution errors or interruption, while temporary database files
 are removed. Invalid arguments are rejected before creating artifacts.
 
 A successful run requires both command results with valid measurements and no
-reported benchmark errors. Performance comparisons and CI integration are not
-included yet. The Python runner tests do not require a built Kvrocks binary:
+reported benchmark errors. The Python runner tests do not require a built Kvrocks binary:
 
 ```shell
 $ python3 -B -m unittest discover -s tests/python -v
 ```
+
+### Comparing two builds
+
+Build the baseline and candidate revisions separately, using the same compiler,
+build options, and dependencies. Pass their build directories to the current
+benchmark runner:
+
+```shell
+$ ./x.py bench-compare /path/to/baseline/build /path/to/candidate/build
+$ ./x.py bench-compare /path/to/baseline/build /path/to/candidate/build --repeats 5 --threshold 20 --requests 100000
+```
+
+The runner measures each build three times by default (minimum three), on the
+same machine, using identical workload settings and the same benchmark tool.
+Each run starts with a fresh database. The baseline runs first in the first pair;
+the candidate runs first in the next pair, alternating thereafter. There is no
+separate warm-up phase yet.
+
+The comparison uses the median measurement for each command. By default, a
+throughput decrease or an average, p50, p95, or p99 latency increase of at least
+20% produces a warning. For example, a decrease from 100,000 to 75,000 requests
+per second is a 25% throughput regression. The threshold is configurable and
+should be calibrated for the runner and workload; it is not a statistical
+significance test. When baseline latency is zero, its percentage change is
+unavailable and that metric does not trigger a warning.
+
+Warnings do not fail the command. Execution errors, invalid measurements, or
+incompatible benchmark versions fail it. A partial report and completed run
+artifacts are retained on failure or interruption.
+
+The printed `benchmark-results/comparison-*` directory contains
+`comparison.json`, with medians, signed percentage changes, verdicts, and
+individual run reports. Raw output and logs are kept under its `baseline` and
+`candidate` subdirectories. A positive percentage means the measurement
+increased: this is better for throughput and worse for latency.
+
+This command does not select commits or build revisions automatically. CI
+integration will supply the two builds.
 
 ### Supported platforms
 
